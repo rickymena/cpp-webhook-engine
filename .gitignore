@@ -1,0 +1,25 @@
+# Build output
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Runtime artifacts - saved webhook payloads can contain tokens and PII
+logs/
+*.log
+
+# Local-only notes
+documentation/
+
+# Object files, libraries, binaries
+*.o
+*.so
+*.a
+*.out
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
