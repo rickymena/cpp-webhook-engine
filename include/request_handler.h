@@ -18,7 +18,7 @@ enum class HttpMethod {
 };
 
 struct HttpRequest {
-HttpMethod method;
+HttpMethod method = HttpMethod::UNKNOWN;
 std::string path;
 std::string version;
 std::unordered_map<std::string, std::string> headers;

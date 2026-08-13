@@ -9,14 +9,19 @@ compile_commands.json
 logs/
 *.log
 
-# Local-only notes
+# Local-only notes and docs (not meant to be committed)
 documentation/
+docs/
 
 # Object files, libraries, binaries
 *.o
+*.obj
 *.so
 *.a
 *.out
+webhook_server
+core
+core.*
 
 # Editor / OS cruft
 .vscode/

@@ -10,27 +10,24 @@ RequestHandler::RequestHandler() {
 
 
 bool RequestHandler::parseRequest(const std::string& raw_data, HttpRequest& request) {
-    std::istringstream stream(raw_data);
-    std::string line;
-
-
-    if (!std::getline(stream, line)) {
+    // Headers end at the first blank line; everything after it is the
+    // body, taken as exact bytes — bodies may be binary and must never
+    // pass through line-oriented parsing.
+    size_t header_end = raw_data.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
         return false;
     }
 
-
-    if (!line.empty() && line.back() == '\r') {
-        line.pop_back();
-    }
-
-
-    std::istringstream request_line(line);
-    std::string method_str, path_with_query, version;
+    size_t line_end = raw_data.find("\r\n");
+    std::istringstream request_line(raw_data.substr(0, line_end));
+    std::string method_str, path_with_query, version, extra;
 
     if (!(request_line >> method_str >> path_with_query >> version)) {
         return false;
     }
-
+    if (request_line >> extra) {
+        return false;
+    }
 
     request.method = parseMethod(method_str);
     request.version = version;
@@ -39,29 +36,11 @@ bool RequestHandler::parseRequest(const std::string& raw_data, HttpRequest& requ
     request.path = path_with_query;
     parseQueryParams(request.path, request);
 
-
-    std::string headers_section;
-    while (std::getline(stream, line)) {
-        if (line == "\r" || line.empty()) {
-            break;
-        }
-        headers_section += line + "\n";
+    if (header_end > line_end) {
+        parseHeaders(raw_data.substr(line_end + 2, header_end - (line_end + 2)), request);
     }
 
-    parseHeaders(headers_section, request);
-
-
-    std::string body;
-    std::string remaining;
-    while (std::getline(stream, remaining)) {
-        body += remaining + "\n";
-    }
-
-    if (!body.empty() && body.back() == '\n') {
-        body.pop_back();
-    }
-
-    request.body = body;
+    request.body = raw_data.substr(header_end + 4);
 
     return true;
 }
@@ -115,25 +94,27 @@ HttpMethod RequestHandler::parseMethod(const std::string& method_str) {
 
 
 void RequestHandler::parseHeaders(const std::string& headers_section, HttpRequest& request) {
-    std::istringstream stream(headers_section);
-    std::string line;
+    size_t pos = 0;
+    while (pos < headers_section.size()) {
+        size_t eol = headers_section.find("\r\n", pos);
+        std::string line = headers_section.substr(
+            pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        pos = (eol == std::string::npos) ? headers_section.size() : eol + 2;
 
-    while (std::getline(stream, line)) {
-        if (line.empty() || line == "\r") continue;
-
-
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-
+        if (line.empty()) continue;
 
         size_t colon_pos = line.find(':');
         if (colon_pos != std::string::npos) {
             std::string key = line.substr(0, colon_pos);
             std::string value = line.substr(colon_pos + 1);
 
+            // Header names are case-insensitive (RFC 7230) — store lowercase
+            std::transform(key.begin(), key.end(), key.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
 
-            value.erase(0, value.find_first_not_of(" \t"));
+            size_t first = value.find_first_not_of(" \t");
+            size_t last = value.find_last_not_of(" \t");
+            value = (first == std::string::npos) ? "" : value.substr(first, last - first + 1);
 
             request.headers[key] = value;
         }
