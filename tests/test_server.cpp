@@ -163,6 +163,17 @@ int main() {
         assert(resp.find("HTTP/1.1 400") == 0);
     }
 
+    // Whitespace before the colon hides a framing header from us while a
+    // proxy may still honor it → 400, never "ignore the line and read
+    // zero body" (RFC 7230 3.2.4; found via fuzz_parse_request)
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST /webhook HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 400") == 0);
+    }
+
     // A single Content-Length still works (the fix must not over-reject)
     {
         int fd = connectTo(port);

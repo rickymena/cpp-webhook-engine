@@ -4,6 +4,48 @@
 #include <cctype>
 
 
+namespace http_syntax {
+
+bool isValidFieldName(const std::string& name) {
+    if (name.empty()) return false;
+    for (unsigned char c : name) {
+        // tchar per RFC 7230 §3.2.6
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+                  c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+                  c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool headerFieldNamesValid(const std::string& header_block) {
+    size_t pos = 0;
+    while (pos < header_block.size()) {
+        size_t eol = header_block.find("\r\n", pos);
+        if (eol == std::string::npos) eol = header_block.size();
+        std::string line = header_block.substr(pos, eol - pos);
+
+        if (!line.empty()) {
+            // obs-fold continuation lines are not supported; RFC 7230
+            // §3.2.4 says reject rather than guess at the join.
+            if (line[0] == ' ' || line[0] == '\t') return false;
+
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) return false;
+            if (!isValidFieldName(line.substr(0, colon))) return false;
+        }
+
+        if (eol == header_block.size()) break;
+        pos = eol + 2;
+    }
+    return true;
+}
+
+} // namespace http_syntax
+
+
 RequestHandler::RequestHandler() {
 
 }
@@ -37,7 +79,13 @@ bool RequestHandler::parseRequest(const std::string& raw_data, HttpRequest& requ
     parseQueryParams(request.path, request);
 
     if (header_end > line_end) {
-        parseHeaders(raw_data.substr(line_end + 2, header_end - (line_end + 2)), request);
+        std::string header_block = raw_data.substr(line_end + 2, header_end - (line_end + 2));
+        // A malformed field name is a rejection, not a line to skip:
+        // whatever we ignore, a proxy in front of us might not.
+        if (!http_syntax::headerFieldNamesValid(header_block)) {
+            return false;
+        }
+        parseHeaders(header_block, request);
     }
 
     request.body = raw_data.substr(header_end + 4);

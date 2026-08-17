@@ -21,6 +21,30 @@ namespace http_limits {
     constexpr int kDrainTimeoutSec = 30;     // graceful-shutdown wait for in-flight clients
 }
 
+// Body framing, decided purely from the bytes received so far — no
+// sockets, no I/O. Kept separate from processClient() so the decision
+// that smuggling attacks target can be unit-tested and fuzzed directly;
+// the CL.CL bug fixed on 2026-08-17 lived here and was unreachable from
+// a test before this split.
+namespace http_framing {
+
+enum class Result {
+    kIncomplete,      // headers not terminated yet — read more
+    kOk,              // framing decided; body is content_length bytes
+    kBadRequest,      // 400: unparsable or conflicting Content-Length
+    kNotImplemented,  // 501: Transfer-Encoding
+    kPayloadTooLarge, // 413: Content-Length over the cap
+    kHeadersTooLarge  // 431
+};
+
+// On kOk, header_end_out is the offset of the terminating CRLFCRLF and
+// content_length_out the declared body size; the full request occupies
+// header_end_out + 4 + content_length_out bytes.
+Result analyze(const std::string& data, std::size_t& header_end_out,
+               std::size_t& content_length_out);
+
+} // namespace http_framing
+
 class HttpServer {
     public:
     explicit HttpServer(int port);

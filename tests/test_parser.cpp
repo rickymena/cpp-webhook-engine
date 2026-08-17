@@ -62,6 +62,31 @@ int main() {
         assert(!handler.parseRequest("", req));
     }
 
+    // Header field names must be RFC 7230 tokens. Found by
+    // fuzz_parse_request: an empty name (":value") was silently accepted
+    // into the header map. Whitespace before the colon matters more —
+    // "Content-Length : 5" is invisible to our framing scanner but may
+    // be honored by a proxy in front of us, which is a desync.
+    {
+        HttpRequest req;
+        assert(!handler.parseRequest("GET / HTTP/1.1\r\n: empty-name\r\n\r\n", req));
+        assert(!handler.parseRequest("GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n", req));
+        assert(!handler.parseRequest("GET / HTTP/1.1\r\nBad Name: v\r\n\r\n", req));
+        assert(!handler.parseRequest("GET / HTTP/1.1\r\nNo-Colon-Here\r\n\r\n", req));
+        // obs-fold continuation lines are rejected, not silently joined
+        assert(!handler.parseRequest("GET / HTTP/1.1\r\nX: a\r\n  folded\r\n\r\n", req));
+    }
+
+    // Valid token characters still parse (the check must not over-reject)
+    {
+        HttpRequest req;
+        std::string raw = "GET / HTTP/1.1\r\nX-Hub-Signature-256: sha256=ab\r\n"
+                          "Weird!#$%&'*+.^_`|~Name: ok\r\n\r\n";
+        assert(handler.parseRequest(raw, req));
+        assert(req.headers.at("x-hub-signature-256") == "sha256=ab");
+        assert(req.headers.at("weird!#$%&'*+.^_`|~name") == "ok");
+    }
+
     std::cout << "test_parser: all assertions passed" << std::endl;
     return 0;
 }

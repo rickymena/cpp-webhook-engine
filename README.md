@@ -55,6 +55,48 @@ rejection, graceful shutdown):
 cd build && ctest --output-on-failure
 ```
 
+### Sanitizers
+
+ASan and UBSan builds are opt-in. `-fno-sanitize-recover=all` makes UBSan
+abort, so a finding fails the test run instead of passing with a warning
+on stderr.
+
+```sh
+cmake -S . -B build-asan -DENABLE_SANITIZERS=ON
+cmake --build build-asan
+cd build-asan && ctest --output-on-failure
+```
+
+Requires the sanitizer runtime: `sudo dnf install libasan libubsan` on
+Fedora, `sudo apt install libasan8 libubsan1` on Debian. Configuring
+without it fails with that instruction rather than an unrelated error.
+
+### Fuzzing
+
+`fuzz_parse_request` feeds untrusted bytes to the request parser and the
+body-framing scanner, the two places where hand-rolled parsing meets the
+network. It checks invariants, not just crashes: bodies must survive as
+exact byte suffixes, header keys must be lowercase tokens, and a framing
+decision must not change when more bytes arrive.
+
+A short bounded run is part of `ctest`. Longer campaigns take an
+iteration count and an optional seed, and the seed alone reproduces a
+failure:
+
+```sh
+./build/tests/fuzz_parse_request 2000000 42
+./build/tests/fuzz_parse_request corpus/crash-input   # replay saved input
+```
+
+With clang, the same harness builds against libFuzzer for coverage-guided
+runs:
+
+```sh
+CXX=clang++ cmake -S . -B build-fuzz -DENABLE_LIBFUZZER=ON -DENABLE_SANITIZERS=ON
+cmake --build build-fuzz
+./build-fuzz/tests/fuzz_parse_request -max_total_time=60
+```
+
 ## Running
 
 ```sh

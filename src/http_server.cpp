@@ -98,6 +98,61 @@ bool parseContentLength(const std::string& value, size_t& out) {
 } // namespace
 
 
+namespace http_framing {
+
+Result analyze(const std::string& data, std::size_t& header_end_out,
+               std::size_t& content_length_out) {
+    header_end_out = 0;
+    content_length_out = 0;
+
+    size_t header_end = data.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return data.size() > http_limits::kMaxHeaderBytes ? Result::kHeadersTooLarge
+                                                          : Result::kIncomplete;
+    }
+    if (header_end > http_limits::kMaxHeaderBytes) return Result::kHeadersTooLarge;
+    header_end_out = header_end;
+
+    // Header *fields* only — skipping the request line keeps an
+    // absolute-form target ("GET http://host:80/x") from ever looking
+    // like a header to the scanner below.
+    size_t request_line_end = data.find("\r\n");
+    std::string header_block;
+    if (request_line_end != std::string::npos && request_line_end < header_end) {
+        header_block = data.substr(request_line_end + 2, header_end - (request_line_end + 2));
+    }
+
+    // Malformed field names are rejected before any framing header is
+    // read: "Content-Length : 5" would otherwise be invisible here and
+    // visible to a proxy, which is a desync (RFC 7230 §3.2.4).
+    if (!http_syntax::headerFieldNamesValid(header_block)) {
+        return Result::kBadRequest;
+    }
+
+    // Content-Length is the only body framing honored; chunked requests
+    // are refused rather than half-implemented (request smuggling risk).
+    std::string te_value;
+    if (findHeaderValue(header_block, "transfer-encoding", te_value) > 0) {
+        return Result::kNotImplemented;
+    }
+
+    std::string cl_value;
+    size_t cl_count = findHeaderValue(header_block, "content-length", cl_value);
+    if (cl_count > 1) {
+        // RFC 7230 3.3.3: conflicting framing must be rejected, not
+        // resolved by picking one (security.md standing rule 4).
+        return Result::kBadRequest;
+    }
+    if (cl_count == 1) {
+        if (!parseContentLength(cl_value, content_length_out)) return Result::kBadRequest;
+        if (content_length_out > http_limits::kMaxBodyBytes) return Result::kPayloadTooLarge;
+    }
+    return Result::kOk;
+}
+
+} // namespace http_framing
+
+
 HttpServer::HttpServer(int port)
     : server_fd(-1), port(port), running(false), active_clients(0) {}
 
@@ -265,54 +320,34 @@ void HttpServer::processClient(int client_fd) {
     char buffer[8192];
     std::string data;
 
-    // Phase 1: read until the blank line that ends the headers
-    size_t header_end;
-    while ((header_end = data.find("\r\n\r\n")) == std::string::npos) {
-        if (data.size() > http_limits::kMaxHeaderBytes) {
-            sendSimpleResponse(client_fd, 431, "Request Header Fields Too Large");
-            return;
-        }
+    // Phase 1: read until framing can be decided from what we have
+    size_t header_end = 0;
+    size_t content_length = 0;
+    http_framing::Result framing;
+    while ((framing = http_framing::analyze(data, header_end, content_length))
+           == http_framing::Result::kIncomplete) {
         if (expired()) return;
         ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
         if (n <= 0) return;  // peer closed, error, or idle timeout
         data.append(buffer, static_cast<size_t>(n));
     }
 
-    // Header *fields* only — skipping the request line keeps an
-    // absolute-form target ("GET http://host:80/x") from ever looking
-    // like a header to the scanner below.
-    size_t request_line_end = data.find("\r\n");
-    std::string header_block;
-    if (request_line_end != std::string::npos && request_line_end < header_end) {
-        header_block = data.substr(request_line_end + 2, header_end - (request_line_end + 2));
-    }
-
-    // Content-Length is the only body framing honored; chunked requests
-    // are refused rather than half-implemented (request smuggling risk).
-    std::string te_value;
-    if (findHeaderValue(header_block, "transfer-encoding", te_value) > 0) {
-        sendSimpleResponse(client_fd, 501, "Not Implemented");
-        return;
-    }
-
-    size_t content_length = 0;
-    std::string cl_value;
-    size_t cl_count = findHeaderValue(header_block, "content-length", cl_value);
-    if (cl_count > 1) {
-        // RFC 7230 §3.3.3: conflicting framing must be rejected, not
-        // resolved by picking one (security.md standing rule 4).
-        sendSimpleResponse(client_fd, 400, "Bad Request");
-        return;
-    }
-    if (cl_count == 1) {
-        if (!parseContentLength(cl_value, content_length)) {
-            sendSimpleResponse(client_fd, 400, "Bad Request");
+    switch (framing) {
+        case http_framing::Result::kOk:
+            break;
+        case http_framing::Result::kHeadersTooLarge:
+            sendSimpleResponse(client_fd, 431, "Request Header Fields Too Large");
             return;
-        }
-        if (content_length > http_limits::kMaxBodyBytes) {
+        case http_framing::Result::kNotImplemented:
+            sendSimpleResponse(client_fd, 501, "Not Implemented");
+            return;
+        case http_framing::Result::kPayloadTooLarge:
             sendSimpleResponse(client_fd, 413, "Payload Too Large");
             return;
-        }
+        case http_framing::Result::kBadRequest:
+        case http_framing::Result::kIncomplete:
+            sendSimpleResponse(client_fd, 400, "Bad Request");
+            return;
     }
 
     // Phase 2: read exactly Content-Length body bytes
