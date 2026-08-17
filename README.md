@@ -85,7 +85,16 @@ failure:
 
 ```sh
 ./build/tests/fuzz_parse_request 2000000 42
-./build/tests/fuzz_parse_request corpus/crash-input   # replay saved input
+./build/tests/fuzz_parse_request corpus/http_request/*   # replay a corpus
+```
+
+A trimmed corpus lives in `corpus/http_request/` and is git-ignored:
+it is derived data, and the inputs are attacker-shaped byte blobs better
+left out of history. Regenerate or extend it with libFuzzer's merge,
+which keeps only the inputs that add coverage:
+
+```sh
+./build-fuzz/tests/fuzz_parse_request -merge=1 corpus/http_request <raw-corpus-dir>
 ```
 
 With clang, the same harness builds against libFuzzer for coverage-guided

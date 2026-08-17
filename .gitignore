@@ -14,6 +14,15 @@ logs/
 documentation/
 docs/
 
+# Fuzzing corpus - regenerate with the merge command in the README.
+# Local-only: it is derived data, and inputs are attacker-shaped byte
+# blobs we would rather not carry in history.
+corpus/
+crash-*
+leak-*
+timeout-*
+oom-*
+
 # Object files, libraries, binaries
 *.o
 *.obj

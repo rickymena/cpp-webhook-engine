@@ -191,8 +191,20 @@ int replayFile(const char* path) {
     while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) bytes.append(buf, n);
     std::fclose(f);
     FuzzOneInput(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
-    std::printf("fuzz: replayed %s (%zu bytes) with no failure\n", path, bytes.size());
     return 0;
+}
+
+// An argument is an iteration count only if it is *entirely* digits.
+// libFuzzer names corpus files by SHA1 hex, so most of them begin with a
+// digit — strtoul alone would silently read
+// "corpus/http_request/002f41..." as "run 2 iterations" and report
+// success without replaying anything.
+bool isAllDigits(const char* s) {
+    if (!*s) return false;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -202,9 +214,14 @@ int replayFile(const char* path) {
 //   fuzz_parse_request <n> [seed]      n iterations, optional RNG seed
 //   fuzz_parse_request <file>...       replay saved corpus/crash inputs
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::strtoul(argv[1], nullptr, 10) == 0) {
+    if (argc > 1 && !isAllDigits(argv[1])) {
         int rc = 0;
-        for (int i = 1; i < argc; ++i) rc |= replayFile(argv[i]);
+        int replayed = 0;
+        for (int i = 1; i < argc; ++i) {
+            rc |= replayFile(argv[i]);
+            ++replayed;
+        }
+        std::printf("fuzz_parse_request: replayed %d input(s)\n", replayed);
         return rc;
     }
 
