@@ -44,7 +44,11 @@ class RequestHandler {
 
     bool parseRequest(const std::string& raw_data, HttpRequest& request);
     HttpResponse handleRequest(const HttpRequest& request);
-    void registerRoute(const std::string& path, HttpMethod method, RouteHandler handler);
+    // Returns false if (method, path) is already registered; the existing
+    // handler is kept. Silently overwriting is the n8n path-collision bug
+    // documented in docs/prior-art.md — the Phase 1 config loader relies
+    // on this rejection to refuse duplicate endpoints at startup.
+    bool registerRoute(const std::string& path, HttpMethod method, RouteHandler handler);
 
     private:
 

@@ -50,10 +50,18 @@ std::string trimWhitespace(const std::string& s) {
     return s.substr(first, last - first + 1);
 }
 
-// Case-insensitive header lookup in the raw header block (header names
-// are case-insensitive per RFC 7230).
-bool findHeaderValue(const std::string& header_block, const std::string& lower_name,
-                     std::string& value_out) {
+// Case-insensitive header lookup in the raw header *field* block (header
+// names are case-insensitive per RFC 7230). Scans the whole block and
+// returns the occurrence count; value_out holds the first occurrence.
+//
+// Callers framing a body must reject a count > 1: two Content-Length
+// headers that disagree let a front proxy and this server disagree about
+// where the request ends (CL.CL request smuggling). The list form
+// "Content-Length: 5, 44" is caught separately by parseContentLength,
+// which rejects any non-digit.
+size_t findHeaderValue(const std::string& header_block, const std::string& lower_name,
+                       std::string& value_out) {
+    size_t count = 0;
     size_t pos = 0;
     while (pos < header_block.size()) {
         size_t eol = header_block.find("\r\n", pos);
@@ -64,14 +72,16 @@ bool findHeaderValue(const std::string& header_block, const std::string& lower_n
             std::transform(key.begin(), key.end(), key.begin(),
                            [](unsigned char c) { return std::tolower(c); });
             if (key == lower_name) {
-                value_out = trimWhitespace(header_block.substr(colon + 1, eol - colon - 1));
-                return true;
+                if (count == 0) {
+                    value_out = trimWhitespace(header_block.substr(colon + 1, eol - colon - 1));
+                }
+                ++count;
             }
         }
         if (eol == header_block.size()) break;
         pos = eol + 2;
     }
-    return false;
+    return count;
 }
 
 bool parseContentLength(const std::string& value, size_t& out) {
@@ -122,14 +132,18 @@ void HttpServer::stop() {
         accept_thread.join();
     }
 
-    // Let in-flight requests finish (socket timeouts bound how long a
-    // client thread can live, so this converges).
+    // Let in-flight requests finish. Client threads are detached and
+    // touch our members (active_clients, drain_cv, request_handler), so
+    // returning while any are live would hand the destructor a
+    // use-after-free — the wait must not give up, only complain. It does
+    // converge: kRecvTimeoutSec/kRequestDeadlineSec bound thread lifetime.
     std::unique_lock<std::mutex> lock(drain_mutex);
-    bool drained = drain_cv.wait_for(lock, std::chrono::seconds(http_limits::kDrainTimeoutSec),
-                                     [this] { return active_clients.load() == 0; });
-    if (!drained) {
+    if (!drain_cv.wait_for(lock, std::chrono::seconds(http_limits::kDrainTimeoutSec),
+                           [this] { return active_clients.load() == 0; })) {
         std::cerr << "Shutdown: " << active_clients.load()
-                  << " client(s) still active after drain timeout" << std::endl;
+                  << " client(s) still active after " << http_limits::kDrainTimeoutSec
+                  << "s drain timeout; still waiting" << std::endl;
+        drain_cv.wait(lock, [this] { return active_clients.load() == 0; });
     }
 }
 
@@ -192,9 +206,13 @@ void HttpServer::acceptLoop() {
         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
 
         if (client_fd < 0) {
-            if (running) {
-                std::cerr << "Accept failed: " << strerror(errno) << std::endl;
-            }
+            if (!running) break;
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            // Resource exhaustion (fd/memory) would otherwise spin this
+            // loop at full speed hammering stderr — back off instead and
+            // let in-flight clients retire descriptors.
+            std::cerr << "Accept failed: " << strerror(errno) << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
 
@@ -205,8 +223,18 @@ void HttpServer::acceptLoop() {
         }
 
         active_clients.fetch_add(1);
-        std::thread client_thread(&HttpServer::handleClient, this, client_fd);
-        client_thread.detach();
+        try {
+            std::thread client_thread(&HttpServer::handleClient, this, client_fd);
+            client_thread.detach();
+        } catch (const std::system_error& e) {
+            // Thread spawn failed (EAGAIN under load). Escaping here
+            // would call std::terminate and strand the counter.
+            active_clients.fetch_sub(1);
+            std::cerr << "Failed to spawn client thread: " << e.what() << std::endl;
+            sendSimpleResponse(client_fd, 503, "Service Unavailable");
+            close(client_fd);
+            drain_cv.notify_all();
+        }
     }
 }
 
@@ -250,19 +278,33 @@ void HttpServer::processClient(int client_fd) {
         data.append(buffer, static_cast<size_t>(n));
     }
 
-    std::string header_block = data.substr(0, header_end);
+    // Header *fields* only — skipping the request line keeps an
+    // absolute-form target ("GET http://host:80/x") from ever looking
+    // like a header to the scanner below.
+    size_t request_line_end = data.find("\r\n");
+    std::string header_block;
+    if (request_line_end != std::string::npos && request_line_end < header_end) {
+        header_block = data.substr(request_line_end + 2, header_end - (request_line_end + 2));
+    }
 
     // Content-Length is the only body framing honored; chunked requests
     // are refused rather than half-implemented (request smuggling risk).
     std::string te_value;
-    if (findHeaderValue(header_block, "transfer-encoding", te_value)) {
+    if (findHeaderValue(header_block, "transfer-encoding", te_value) > 0) {
         sendSimpleResponse(client_fd, 501, "Not Implemented");
         return;
     }
 
     size_t content_length = 0;
     std::string cl_value;
-    if (findHeaderValue(header_block, "content-length", cl_value)) {
+    size_t cl_count = findHeaderValue(header_block, "content-length", cl_value);
+    if (cl_count > 1) {
+        // RFC 7230 §3.3.3: conflicting framing must be rejected, not
+        // resolved by picking one (security.md standing rule 4).
+        sendSimpleResponse(client_fd, 400, "Bad Request");
+        return;
+    }
+    if (cl_count == 1) {
         if (!parseContentLength(cl_value, content_length)) {
             sendSimpleResponse(client_fd, 400, "Bad Request");
             return;

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -14,7 +15,9 @@
 #include <thread>
 #include "../include/http_server.h"
 #include "../include/request_handler.h"
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 
 std::unique_ptr<HttpServer> g_server;
@@ -70,8 +73,13 @@ int main(int argc, char* argv[]){
     auto handler = std::make_shared<RequestHandler>();
 
 
-    handler->registerRoute("/webhook", HttpMethod::POST, handleGenericWebhook );
-    handler->registerRoute("/health", HttpMethod::GET, handleHealthCheck );
+    // Duplicate (method, path) is a startup error, never a silent
+    // overwrite (docs/prior-art.md — the n8n path-collision bug).
+    if (!handler->registerRoute("/webhook", HttpMethod::POST, handleGenericWebhook)
+        || !handler->registerRoute("/health", HttpMethod::GET, handleHealthCheck)) {
+        std::cerr << "Duplicate route registration" << std::endl;
+        return 1;
+    }
 
     g_server->setRequestHandler(handler);
     if (!g_server->start()){
@@ -168,21 +176,52 @@ void saveWebhookPayload(const HttpRequest& request, const ServerConfig& config) 
           extension = ".json";
       }
 
-      std::stringstream filename;
-      filename << config.payload_dir << "/webhook_"
-               << std::put_time(&tm_buf, "%Y%m%d_%H%M%S")
-               << "_" << ms.count() << extension;
+      // Timestamp alone collides when two webhooks land in the same
+      // millisecond, and ofstream truncates the loser. A process-wide
+      // counter disambiguates; O_EXCL turns any residual collision into
+      // a retry instead of silent data loss. The name never derives from
+      // payload content (security.md standing rule 3).
+      static std::atomic<unsigned long> seq{0};
 
-      std::ofstream file(filename.str(), std::ios::binary);
-      if (!file) {
-          logMessage("ERROR", "Failed to open payload file " + filename.str());
+      int fd = -1;
+      std::string path;
+      for (int attempt = 0; attempt < 8 && fd < 0; ++attempt) {
+          std::stringstream filename;
+          filename << config.payload_dir << "/webhook_"
+                   << std::put_time(&tm_buf, "%Y%m%d_%H%M%S")
+                   << "_" << ms.count()
+                   << "_" << seq.fetch_add(1) << extension;
+          path = filename.str();
+          // Created 0600 outright — an ofstream would exist as 0644 for
+          // the width of the chmod that used to follow (security.md §5).
+          fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+          if (fd < 0 && errno != EEXIST) break;
+      }
+      if (fd < 0) {
+          logMessage("ERROR", "Failed to open payload file " + path + ": " + strerror(errno));
           return;
       }
-      file.write(request.body.data(), static_cast<std::streamsize>(request.body.size()));
-      file.close();
-      chmod(filename.str().c_str(), 0600);
 
-      logMessage("INFO", "Saved payload to " + filename.str());
+      const char* p = request.body.data();
+      size_t remaining = request.body.size();
+      bool write_ok = true;
+      while (remaining > 0) {
+          ssize_t n = write(fd, p, remaining);
+          if (n < 0) {
+              if (errno == EINTR) continue;
+              write_ok = false;
+              break;
+          }
+          p += n;
+          remaining -= static_cast<size_t>(n);
+      }
+      close(fd);
+
+      if (!write_ok) {
+          logMessage("ERROR", "Failed to write payload file " + path + ": " + strerror(errno));
+          return;
+      }
+      logMessage("INFO", "Saved payload to " + path);
   }
 
 ServerConfig loadConfiguration(int argc, char* argv[]) {

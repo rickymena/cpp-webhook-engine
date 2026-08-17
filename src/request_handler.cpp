@@ -71,9 +71,10 @@ HttpResponse RequestHandler::handleRequest(const HttpRequest& request) {
 }
 
 
-void RequestHandler::registerRoute(const std::string& path, HttpMethod method, RouteHandler handler) {
+bool RequestHandler::registerRoute(const std::string& path, HttpMethod method, RouteHandler handler) {
     std::string route_key = buildRouteKey(method, path);
-    routes[route_key] = handler;
+    // emplace leaves the incumbent in place on collision and tells us.
+    return routes.emplace(route_key, std::move(handler)).second;
 }
 
 

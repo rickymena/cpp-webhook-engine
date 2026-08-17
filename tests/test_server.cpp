@@ -132,6 +132,57 @@ int main() {
         assert(resp.find("HTTP/1.1 404") == 0);
     }
 
+    // Two Content-Length headers → 400, never "pick one and proceed".
+    // Framing on the first value while a front proxy frames on the
+    // second is CL.CL request smuggling (security.md, RFC 7230 §3.3.3).
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST /webhook HTTP/1.1\r\nHost: x\r\n"
+                    "Content-Length: 5\r\nContent-Length: 44\r\n\r\nhello");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 400") == 0);
+    }
+
+    // Same, with the duplicate spelled in a different case
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST /webhook HTTP/1.1\r\nContent-Length: 2\r\n"
+                    "CONTENT-LENGTH: 2\r\n\r\nhi");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 400") == 0);
+    }
+
+    // List form "5, 44" is the same attack spelled differently → 400
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST /webhook HTTP/1.1\r\nContent-Length: 5, 44\r\n\r\nhello");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 400") == 0);
+    }
+
+    // A single Content-Length still works (the fix must not over-reject)
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST /webhook HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 200 OK") == 0);
+    }
+
+    // An absolute-form target carries a colon; it must not be scanned as
+    // a header field (the header block now starts after the request line)
+    {
+        int fd = connectTo(port);
+        sendRaw(fd, "POST http://127.0.0.1:8080/webhook HTTP/1.1\r\n"
+                    "Content-Length: 5\r\n\r\nhello");
+        std::string resp = readResponse(fd);
+        close(fd);
+        assert(resp.find("HTTP/1.1 404") == 0);  // parsed fine, just no such route
+    }
+
     // Graceful stop: an in-flight request finishes before stop() returns
     {
         std::string body(10 * 1024, 'y');
