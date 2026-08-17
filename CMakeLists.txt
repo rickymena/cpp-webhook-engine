@@ -54,8 +54,17 @@ endif()
 #   CXX=clang++ cmake -S . -B build-fuzz -DENABLE_LIBFUZZER=ON -DENABLE_SANITIZERS=ON
 #   ./build-fuzz/tests/fuzz_parse_request -max_total_time=60
 option(ENABLE_LIBFUZZER "Build fuzz targets against libFuzzer (requires clang)" OFF)
-if(ENABLE_LIBFUZZER AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    message(FATAL_ERROR "ENABLE_LIBFUZZER requires clang; got ${CMAKE_CXX_COMPILER_ID}")
+if(ENABLE_LIBFUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "ENABLE_LIBFUZZER requires clang; got ${CMAKE_CXX_COMPILER_ID}")
+    endif()
+    # Coverage instrumentation must reach the code under test, not just
+    # the harness: the parsers live in webhook_core, so fuzzer-no-link
+    # goes on everything and only the fuzz binary links the driver.
+    # Instrumenting the harness alone leaves libFuzzer with no feedback
+    # signal from the parser it is supposed to be exploring.
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=fuzzer-no-link")
+    message(STATUS "libFuzzer enabled (coverage instrumentation on all targets)")
 endif()
 
 # Include directories - tell compiler where to find header files
@@ -102,8 +111,9 @@ set_target_properties(fuzz_parse_request PROPERTIES
 )
 
 if(ENABLE_LIBFUZZER)
+    # Coverage instrumentation is already global (fuzzer-no-link above);
+    # this target additionally links libFuzzer's own main().
     target_compile_definitions(fuzz_parse_request PRIVATE FUZZING_LIBFUZZER)
-    target_compile_options(fuzz_parse_request PRIVATE -fsanitize=fuzzer)
     target_link_libraries(fuzz_parse_request -fsanitize=fuzzer)
     # libFuzzer runs until stopped; not a CTest case.
 else()
